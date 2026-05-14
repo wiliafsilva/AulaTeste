@@ -1,0 +1,9 @@
+{
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false,
+  "exclude": [
+    "**/site-packages",
+    "**/.venv",
+    "**/venv"
+  ]
+}

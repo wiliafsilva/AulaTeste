@@ -23,6 +23,11 @@
 import cv2
 import time
 import numpy as np
+import io
+try:
+    import torch
+except Exception:
+    torch = None
 try:
     from feat import Detector
 except ImportError as e:
@@ -39,12 +44,22 @@ except ImportError as e:
 # CONFIGURAÇÃO DOS MODELOS
 # ============================================================
 
+device = "cpu"
+if torch is not None:
+    try:
+        if torch.cuda.is_available():
+            device = "cuda"
+    except Exception:
+        device = "cpu"
+
+print(f"Using device: {device}")
+
 detector = Detector(
     face_model="retinaface",
     landmark_model="pfld",
     au_model="xgb",
     emotion_model="resmasknet",
-    device="cpu"  # use "cuda" se tiver GPU NVIDIA
+    device=device
 )
 
 # ============================================================
@@ -61,6 +76,28 @@ EMOTIONS = [
     "neutral"
 ]
 
+# Mapeamento de emoções para Português (compatível com os nomes do py-feat)
+EMOTION_MAP = {
+    "anger": "Raiva",
+    "disgust": "Nojo",
+    "fear": "Medo",
+    "happiness": "Feliz",
+    "sadness": "Triste",
+    "surprise": "Surpresa",
+    "neutral": "Neutro",
+}
+
+# Cores BGR para cada emoção (usadas ao desenhar as porcentagens)
+EMOTION_COLORS = {
+    "anger": (0, 0, 255),       # vermelho
+    "disgust": (0, 128, 0),     # verde escuro
+    "fear": (128, 0, 128),      # roxo
+    "happiness": (0, 215, 255), # dourado/laranja
+    "sadness": (255, 0, 0),     # azul
+    "surprise": (255, 0, 255),  # magenta
+    "neutral": (200, 200, 200), # cinza
+}
+
 # ============================================================
 # INICIAR WEBCAM
 # ============================================================
@@ -76,135 +113,140 @@ if not cap.isOpened():
 # ============================================================
 
 prev_time = time.time()
+frame_count = 0
+last_emotions = None
+last_face_boxes = None
 
-while True:
+try:
+    while True:
 
-    ret, frame = cap.read()
+        ret, frame = cap.read()
 
-    if not ret:
-        break
+        if not ret:
+            break
 
-    # --------------------------------------------------------
-    # Conversão BGR -> RGB
-    # --------------------------------------------------------
+        # --------------------------------------------------------
+        # Conversão BGR -> RGB
+        # --------------------------------------------------------
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # --------------------------------------------------------
-    # DETECÇÃO
-    # --------------------------------------------------------
+        # --------------------------------------------------------
+        # DETECÇÃO (redimensionar para acelerar e escalar de volta)
+        # Processa emoções a cada 2 frames para ganho de FPS
+        # --------------------------------------------------------
 
-    try:
+        try:
+            frame_count += 1
+            detect_emotions_this_frame = (frame_count % 2 == 0)
 
-        predictions = detector.detect_image(rgb)
+            # redimensionar imagem para largura máxima (mantém proporção)
+            det_img = rgb
+            scale = 1.0
+            max_w = 320
+            h, w = rgb.shape[:2]
+            if w > max_w:
+                scale = w / max_w
+                det_img = cv2.resize(rgb, (max_w, int(h / scale)))
 
-        if len(predictions) > 0:
+            # Sempre detecta rostos (rápido)
+            faces = detector.detect_faces(det_img)
 
-            for idx in range(len(predictions)):
+            # Detecta emoções apenas a cada 2 frames para ganho de performance
+            first_emotions = None
+            emotion_cols = detector.info.get("emotion_model_columns", EMOTIONS)
+            
+            if len(faces) > 0 and len(faces[0]) > 0:
+                if detect_emotions_this_frame:
+                    # Detectar landmarks e emoções apenas a cada 2 frames
+                    landmarks = detector.detect_landmarks(det_img, faces)
+                    emotions_list = detector.detect_emotions(det_img, faces, landmarks)
+                    last_emotions = emotions_list
+                    last_face_boxes = faces
+                else:
+                    # Reutilizar emoções do frame anterior
+                    emotions_list = last_emotions
 
-                row = predictions.iloc[idx]
+                # Desenhar rostos e emoções
+                if emotions_list is not None:
+                    for face_idx, face in enumerate(last_face_boxes[0] if last_face_boxes else faces[0]):
+                        x1, y1, x2, y2, conf = face
 
-                # ------------------------------------------------
-                # Bounding box
-                # ------------------------------------------------
+                        # escalar coordenadas de volta para o frame original
+                        x1o = int(x1 * scale)
+                        y1o = int(y1 * scale)
+                        x2o = int(x2 * scale)
+                        y2o = int(y2 * scale)
+                        x, y, w_box, h_box = x1o, y1o, x2o - x1o, y2o - y1o
 
-                x = int(row["FaceRectX"])
-                y = int(row["FaceRectY"])
-                w = int(row["FaceRectWidth"])
-                h = int(row["FaceRectHeight"])
+                        cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
 
-                cv2.rectangle(
-                    frame,
-                    (x, y),
-                    (x + w, y + h),
-                    (0, 255, 0),
-                    2
-                )
+                        emo_vals = emotions_list[0][face_idx]  # numpy array
+                        emotion_values = {
+                            emotion_cols[i]: float(emo_vals[i]) * 100
+                            for i in range(len(emotion_cols))
+                        }
+                        # guardar para desenhar a lista à esquerda (apenas a primeira face)
+                        if first_emotions is None:
+                            first_emotions = emotion_values
 
-                # ------------------------------------------------
-                # EMOÇÕES
-                # ------------------------------------------------
+                        # Emoção dominante (estilo melhorado: maior, sem contorno duplicado)
+                        dominant_emotion = max(emotion_values, key=lambda k: emotion_values[k])
+                        dominant_value = emotion_values[dominant_emotion]
 
-                emotion_values = {}
+                        dominant_label = EMOTION_MAP.get(dominant_emotion, dominant_emotion)
+                        dominant_text = f"{dominant_label}: {int(dominant_value)}%"
 
-                for emotion in EMOTIONS:
-                    value = float(row[emotion]) * 100
-                    emotion_values[emotion] = value
+                        # Texto maior e mais legível (DUPLEX, tamanho 1.2)
+                        cv2.putText(frame, dominant_text, (x, y - 10), cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 255, 0), 2, cv2.LINE_AA)
 
-                # Emoção dominante
-                dominant_emotion = max(
-                    emotion_values,
-                    key=emotion_values.get
-                )
+                    # Desenhar lista de porcentagens no lado esquerdo (para a primeira face detectada)
+                    if first_emotions is not None:
+                        left_x = 10
+                        left_y = 30
+                        offset = 0
+                        # desenhar nas mesmas colunas definidas em emotion_cols (ordem consistente)
+                        for emotion in emotion_cols:
+                            value = first_emotions.get(emotion, 0)
+                            label = EMOTION_MAP.get(emotion, emotion)
+                            pct = max(0, min(int(value), 100))
+                            percent_text = f"{label}: {pct}%"
+                            color = EMOTION_COLORS.get(emotion, (255, 255, 255))
 
-                dominant_value = emotion_values[dominant_emotion]
+                            # Estilo melhorado: DUPLEX (mais elegante) e tamanho 0.75
+                            cv2.putText(frame, percent_text, (left_x, left_y + offset), cv2.FONT_HERSHEY_DUPLEX, 0.75, color, 2, cv2.LINE_AA)
 
-                # ------------------------------------------------
-                # TEXO PRINCIPAL
-                # ------------------------------------------------
+                            offset += 25
+        except Exception as e:
+            print("Erro:", e)
 
-                cv2.putText(
-                    frame,
-                    f"{dominant_emotion}: {dominant_value:.2f}%",
-                    (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2
-                )
+        # --------------------------------------------------------
+        # FPS (canto superior direito)
+        # --------------------------------------------------------
 
-                # ------------------------------------------------
-                # LISTA COMPLETA DAS EMOÇÕES
-                # ------------------------------------------------
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if (current_time - prev_time) > 0 else 0.0
+        prev_time = current_time
 
-                offset = 20
+        fps_text = f"FPS: {fps:.2f}"
+        fps_x = frame.shape[1] - 150
+        # contorno escuro
+        cv2.putText(frame, fps_text, (fps_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+        # texto em amarelo
+        cv2.putText(frame, fps_text, (fps_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-                for emotion, value in emotion_values.items():
+        # --------------------------------------------------------
+        # EXIBIR
+        # --------------------------------------------------------
 
-                    text = f"{emotion}: {value:.2f}%"
+        cv2.imshow("Py-Feat Emotion Detection", frame)
 
-                    cv2.putText(
-                        frame,
-                        text,
-                        (x, y + h + offset),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        1
-                    )
+        # ESC ou 'q' para sair
+        if cv2.waitKey(1) & 0xFF in (27, ord('q')):
+            break
 
-                    offset += 20
-
-    except Exception as e:
-        print("Erro:", e)
-
-    # --------------------------------------------------------
-    # FPS
-    # --------------------------------------------------------
-
-    current_time = time.time()
-    fps = 1 / (current_time - prev_time)
-    prev_time = current_time
-
-    cv2.putText(
-        frame,
-        f"FPS: {fps:.2f}",
-        (20, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2
-    )
-
-    # --------------------------------------------------------
-    # EXIBIR
-    # --------------------------------------------------------
-
-    cv2.imshow("Py-Feat Emotion Detection", frame)
-
-    # ESC para sair
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
+except KeyboardInterrupt:
+    print("Interrompido pelo usuário")
 
 # ============================================================
 # FINALIZAR
